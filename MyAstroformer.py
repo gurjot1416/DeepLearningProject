@@ -36,7 +36,6 @@ CoAtNet: Marrying Convolution and Attention for All Data Sizes - https://arxiv.o
   volume    = {abs/2106.04803},
   year      = {2021}
 }
-  sd   
 Hacked together by / Copyright 2022, Ross Wightman
 """
 
@@ -2335,3 +2334,4 @@ def maxvit_xlarge_tf_384(pretrained=False, **kwargs) -> MaxxVit:
 @register_model
 def maxvit_xlarge_tf_512(pretrained=False, **kwargs) -> MaxxVit:
     return _create_maxxvit('maxvit_xlarge_tf_512', 'maxvit_xlarge_tf', pretrained=pretrained, **kwargs)
+
