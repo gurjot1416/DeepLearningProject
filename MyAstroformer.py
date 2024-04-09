@@ -2,10 +2,12 @@
 import numpy as np
 import pandas as pd
 import math
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, replace, field
 from functools import partial
 from typing import Callable, Optional, Union, Tuple, List
+sys.path.append("../../../")
 
 import torch
 from torch import nn
@@ -15,11 +17,12 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import Mlp, ConvMlp, DropPath, LayerNorm, ClassifierHead, NormMlpClassifierHead
 from timm.layers import create_attn, get_act_layer, get_norm_layer, get_norm_act_layer, create_conv2d, create_pool2d
 from timm.layers import trunc_normal_tf_, to_2tuple, extend_tuple, make_divisible, _assert
-from timm.layers import RelPosMlp, RelPosBias, RelPosBiasTf, use_fused_attn, resize_rel_pos_bias_table
+from timm.layers import RelPosMlp, RelPosBias, RelPosBiasTf, use_fused_attn, resize_rel_pos_bias_table 
 from ._builder import build_model_with_cfg
 from ._features_fx import register_notrace_function
 from ._manipulate import named_apply, checkpoint_seq
 from ._registry import generate_default_cfgs, register_model
+from timm.models.registry import register_model
 
 __all__ = ['MYAstroformer', 'MaxxVitConvCfg', 'MaxxVitTransformerCfg', 'MaxxVit']
 
@@ -101,7 +104,7 @@ class MYAstroformer:
 
     embed_dim: Tuple[int, ...] = (96, 192, 384, 768)  # Embedding dimensions for each stage of the model
     depths: Tuple[int, ...] = (2, 3, 5, 2)  # Number of blocks in each stage
-    block_type: Tuple[Union[str, Tuple[str, ...]], ...] = ('C', 'C', 'T', 'T')  # Type of blocks used in each stage, C for Conv and T for Transformer
+    block_type: Tuple[Union[str, Tuple[str, ...]], ...] = ('C', 'C', 'C', 'T')  # Type of blocks used in each stage, C for Conv and T for Transformer
     stem_width: Union[int, Tuple[int, int]] = 64  # Number of channels in the stem, can be a tuple for models with two stem layers
     stem_bias: bool = False  # Whether the stem layers include a bias term
     conv_cfg: MaxxVitConvCfg = field(default_factory=MaxxVitConvCfg)  # Configuration for convolutional blocks
@@ -165,8 +168,13 @@ class Attention2d(nn.Module):
             ).transpose(-1, -2).reshape(B, -1, H, W)
         else:
             q *= self.scale  # Apply scaling
-            attn = (q.transpose(-2, -1) @ k) + (self.rel_pos(attn) if self.rel_pos is not None else 0)
-            attn = self.attn_drop(attn.softmax(dim=-1))
+            attn = q.transpose(-2, -1) @ k
+            if self.rel_pos is not None:
+                attn = self.rel_pos(attn)
+            elif shared_rel_pos is not None:
+                attn = attn + shared_rel_pos
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
             x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W)
 
         # Apply output projection and dropout
@@ -222,7 +230,11 @@ class AttentionCl(nn.Module):
 
         # Apply attention mechanism (fused or standard) with optional relative positional bias
         if self.fused_attn:
-            attn_bias = self.rel_pos.get_bias() if self.rel_pos is not None else shared_rel_pos
+            attn_bias = None
+            if self.rel_pos is not None:
+                attn_bias = self.rel_pos.get_bias()
+            elif shared_rel_pos is not None:
+                attn_bias = shared_rel_pos
             x = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_bias,
@@ -350,9 +362,8 @@ class Downsample2d(nn.Module):
 
     def forward(self, x):
         # Apply pooling to downsample spatial dimensions
-        x = self.pool(x)
         # Expand channels if necessary
-        x = self.expand(x)
+        x = self.expand(self.pool(x))
         return x
 
 
@@ -367,25 +378,25 @@ def _init_transformer(module, name, scheme=''):
     """
     # Initialize Conv2d and Linear layers according to the specified scheme
     if isinstance(module, (nn.Conv2d, nn.Linear)):
-        if scheme == 'normal':
-            # Normal initialization
-            nn.init.normal_(module.weight, std=.02)
-        elif scheme == 'trunc_normal':
-            # Truncated normal initialization
-            trunc_normal_tf_(module.weight, std=.02)
-        elif scheme == 'xavier_normal':
-            # Xavier normal initialization
-            nn.init.xavier_normal_(module.weight)
-        else:
-            # Default initialization (similar to ViT)
-            nn.init.xavier_uniform_(module.weight)
-
-        # Initialize biases if present
-        if module.bias is not None:
-            if 'mlp' in name:
-                nn.init.normal_(module.bias, std=1e-6)
-            else:
+        if scheme == "normal":
+            nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        elif scheme == "trunc_normal":
+            trunc_normal_tf_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif scheme == "xavier_normal":
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        else:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                if "mlp" in name:
+                    nn.init.normal_(module.bias, std=1e-6)
+                else:
+                    nn.init.zeros_(module.bias)
 
 
 class TransformerBlock2d(nn.Module):
@@ -561,12 +572,11 @@ class MbConvBlock(nn.Module):
 
     def forward(self, x):
         shortcut = self.shortcut(x)
-        x = self.pre_norm(x)
-        x = self.down(x)
+    
+        x = self.down(self.pre_norm(x))
 
         # 1x1 expansion conv & norm-act
-        x = self.conv1_1x1(x)
-        x = self.norm1(x)
+        x = self.norm1(self.conv1_1x1(x))
 
         # depthwise / grouped 3x3 conv w/ SE (or other) channel attention & norm-act
         x = self.conv2_kxk(x)
@@ -577,8 +587,7 @@ class MbConvBlock(nn.Module):
             x = self.se(x)
 
         # 1x1 linear projection to output width
-        x = self.conv3_1x1(x)
-        x = self.drop_path(x) + shortcut
+        x = self.drop_path(self.conv3_1x1(x)) + shortcut
         return x
 
 
@@ -727,7 +736,7 @@ def window_reverse(windows, window_size: List[int], img_size: List[int]):
 
 
 def grid_partition(x, grid_size: List[int]):
-        """
+    """
     Divides an image into a grid of non-overlapping windows (patches).
 
     Args:
@@ -747,7 +756,7 @@ def grid_partition(x, grid_size: List[int]):
 
 @register_notrace_function  # reason: int argument is a Proxy
 def grid_reverse(windows, grid_size: List[int], img_size: List[int]):
-        """
+    """
     Reconstructs an image from a sequence of windows (patches).
 
     Args:
@@ -768,7 +777,7 @@ def grid_reverse(windows, grid_size: List[int], img_size: List[int]):
 
 
 def get_rel_pos_cls(cfg: MaxxVitTransformerCfg, window_size):
-        """
+    """
     Selects an appropriate relative position encoding class based on configuration.
 
     Args:
@@ -953,7 +962,7 @@ class ParallelPartitionAttention(nn.Module):
 
 
 def window_partition_nchw(x, window_size: List[int]):
-       """Divides the input tensor into windows (NCHW format).
+    """Divides the input tensor into windows (NCHW format).
 
     Args:
         x: Input tensor with shape (Batch, Channels, Height, Width)
@@ -971,7 +980,7 @@ def window_partition_nchw(x, window_size: List[int]):
 
 @register_notrace_function  # reason: int argument is a Proxy
 def window_reverse_nchw(windows, window_size: List[int], img_size: List[int]):
-     """Reconstructs the original tensor from windows (NCHW format).
+    """Reconstructs the original tensor from windows (NCHW format).
 
     Args:
         windows: Tensor of windows 
@@ -992,7 +1001,7 @@ def window_reverse_nchw(windows, window_size: List[int], img_size: List[int]):
 
 
 def grid_partition_nchw(x, grid_size: List[int]):
-        """Splits an image tensor into non-overlapping grids (NCHW format).
+    """Splits an image tensor into non-overlapping grids (NCHW format).
 
     Args:
         x: Input tensor in NCHW format (Batch, Channels, Height, Width)
@@ -1304,7 +1313,7 @@ class Stem(nn.Module):
 
 
 def cfg_window_size(cfg: MaxxVitTransformerCfg, img_size: Tuple[int, int]):
-        """Configures window size parameters within the MaxxVitTransformerCfg.
+    """Configures window size parameters within the MaxxVitTransformerCfg.
 
     Args:
         cfg: The MaxxVitTransformerCfg configuration object.
@@ -1317,14 +1326,14 @@ def cfg_window_size(cfg: MaxxVitTransformerCfg, img_size: Tuple[int, int]):
         assert cfg.grid_size
         return cfg
      # Calculate partition size based on image size and partition ratio 
-    partition_size = img_size[0] // cfg.partition_ratio, img_size[1] // cfg.partition_ratio
+    partition_size = (img_size[0] // cfg.partition_ratio, img_size[1] // cfg.partition_ratio)
     # Update configuration with calculated values
     cfg = replace(cfg, window_size=partition_size, grid_size=partition_size)
     return cfg
 
 
 def _overlay_kwargs(cfg: MYAstroformer, **kwargs):
-        """Separates keyword arguments for targeted configuration updates.
+    """Separates keyword arguments for targeted configuration updates.
 
     Args:
         cfg: The MYAstroformer configuration object.
@@ -1504,3 +1513,822 @@ model_cfgs = dict(
         head_hidden_size=2048,
     )
 )
+# def _rw_coat_cfg(
+#         stride_mode='pool',
+#         pool_type='avg2',
+#         conv_output_bias=False,
+#         conv_attn_early=False,
+#         conv_attn_act_layer='relu',
+#         conv_norm_layer='',
+#         transformer_shortcut_bias=True,
+#         transformer_norm_layer='layernorm2d',
+#         transformer_norm_layer_cl='layernorm',
+#         init_values=None,
+#         rel_pos_type='bias',
+#         rel_pos_dim=512,
+# ):
+#     # 'RW' timm variant models were created and trained before seeing https://github.com/google-research/maxvit
+#     # Common differences for initial timm models:
+#     # - pre-norm layer in MZBConv included an activation after norm
+#     # - mbconv expansion calculated from input instead of output chs
+#     # - mbconv shortcut and final 1x1 conv did not have a bias
+#     # - SE act layer was relu, not silu
+#     # - mbconv uses silu in timm, not gelu
+#     # - expansion in attention block done via output proj, not input proj
+#     # Variable differences (evolved over training initial models):
+#     # - avg pool with kernel_size=2 favoured downsampling (instead of maxpool for coat)
+#     # - SE attention was between conv2 and norm/act
+#     # - default to avg pool for mbconv downsample instead of 1x1 or dw conv
+#     # - transformer block shortcut has no bias
+#     return dict(
+#         conv_cfg=MaxxVitConvCfg(
+#             stride_mode=stride_mode,
+#             pool_type=pool_type,
+#             pre_norm_act=True,
+#             expand_output=False,
+#             output_bias=conv_output_bias,
+#             attn_early=conv_attn_early,
+#             attn_act_layer=conv_attn_act_layer,
+#             act_layer='silu',
+#             norm_layer=conv_norm_layer,
+#         ),
+#         transformer_cfg=MaxxVitTransformerCfg(
+#             expand_first=False,
+#             shortcut_bias=transformer_shortcut_bias,
+#             pool_type=pool_type,
+#             init_values=init_values,
+#             norm_layer=transformer_norm_layer,
+#             norm_layer_cl=transformer_norm_layer_cl,
+#             rel_pos_type=rel_pos_type,
+#             rel_pos_dim=rel_pos_dim,
+#         ),
+#     )
+
+
+# def _rw_max_cfg(
+#         stride_mode='dw',
+#         pool_type='avg2',
+#         conv_output_bias=False,
+#         conv_attn_ratio=1 / 16,
+#         conv_norm_layer='',
+#         transformer_norm_layer='layernorm2d',
+#         transformer_norm_layer_cl='layernorm',
+#         window_size=None,
+#         dim_head=32,
+#         init_values=None,
+#         rel_pos_type='bias',
+#         rel_pos_dim=512,
+# ):
+#     # 'RW' timm variant models were created and trained before seeing https://github.com/google-research/maxvit
+#     # Differences of initial timm models:
+#     # - mbconv expansion calculated from input instead of output chs
+#     # - mbconv shortcut and final 1x1 conv did not have a bias
+#     # - mbconv uses silu in timm, not gelu
+#     # - expansion in attention block done via output proj, not input proj
+#     return dict(
+#         conv_cfg=MaxxVitConvCfg(
+#             stride_mode=stride_mode,
+#             pool_type=pool_type,
+#             expand_output=False,
+#             output_bias=conv_output_bias,
+#             attn_ratio=conv_attn_ratio,
+#             act_layer='silu',
+#             norm_layer=conv_norm_layer,
+#         ),
+#         transformer_cfg=MaxxVitTransformerCfg(
+#             expand_first=False,
+#             pool_type=pool_type,
+#             dim_head=dim_head,
+#             window_size=window_size,
+#             init_values=init_values,
+#             norm_layer=transformer_norm_layer,
+#             norm_layer_cl=transformer_norm_layer_cl,
+#             rel_pos_type=rel_pos_type,
+#             rel_pos_dim=rel_pos_dim,
+#         ),
+#     )
+
+
+# def _next_cfg(
+#         stride_mode='dw',
+#         pool_type='avg2',
+#         conv_norm_layer='layernorm2d',
+#         conv_norm_layer_cl='layernorm',
+#         transformer_norm_layer='layernorm2d',
+#         transformer_norm_layer_cl='layernorm',
+#         window_size=None,
+#         no_block_attn=False,
+#         init_values=1e-6,
+#         rel_pos_type='mlp',  # MLP by default for maxxvit
+#         rel_pos_dim=512,
+# ):
+#     # For experimental models with convnext instead of mbconv
+#     init_values = to_2tuple(init_values)
+#     return dict(
+#         conv_cfg=MaxxVitConvCfg(
+#             block_type='convnext',
+#             stride_mode=stride_mode,
+#             pool_type=pool_type,
+#             expand_output=False,
+#             init_values=init_values[0],
+#             norm_layer=conv_norm_layer,
+#             norm_layer_cl=conv_norm_layer_cl,
+#         ),
+#         transformer_cfg=MaxxVitTransformerCfg(
+#             expand_first=False,
+#             pool_type=pool_type,
+#             window_size=window_size,
+#             no_block_attn=no_block_attn,  # enabled for MaxxViT-V2
+#             init_values=init_values[1],
+#             norm_layer=transformer_norm_layer,
+#             norm_layer_cl=transformer_norm_layer_cl,
+#             rel_pos_type=rel_pos_type,
+#             rel_pos_dim=rel_pos_dim,
+#         ),
+#     )
+
+
+# def _tf_cfg():
+#     return dict(
+#         conv_cfg=MaxxVitConvCfg(
+#             norm_eps=1e-3,
+#             act_layer='gelu_tanh',
+#             padding='same',
+#         ),
+#         transformer_cfg=MaxxVitTransformerCfg(
+#             norm_eps=1e-5,
+#             act_layer='gelu_tanh',
+#             head_first=False,  # heads are interleaved (q_nh, q_hdim, k_nh, q_hdim, ....)
+#             rel_pos_type='bias_tf',
+#         ),
+#     )
+
+
+# model_cfgs = dict(
+#     # timm specific CoAtNet configs
+#     coatnet_pico_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 3, 5, 2),
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(  # using newer max defaults here
+#             conv_output_bias=True,
+#             conv_attn_ratio=0.25,
+#         ),
+#     ),
+#     coatnet_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(3, 4, 6, 3),
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(  # using newer max defaults here
+#             stride_mode='pool',
+#             conv_output_bias=True,
+#             conv_attn_ratio=0.25,
+#         ),
+#     ),
+#     coatnet_0_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 3, 7, 2),  # deeper than paper '0' model
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             conv_attn_early=True,
+#             transformer_shortcut_bias=False,
+#         ),
+#     ),
+#     coatnet_1_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_early=True,
+#             transformer_shortcut_bias=False,
+#         )
+#     ),
+#     coatnet_2_rw=MaxxVitCfg(
+#         embed_dim=(128, 256, 512, 1024),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(64, 128),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_act_layer='silu',
+#             #init_values=1e-6,
+#         ),
+#     ),
+#     coatnet_3_rw=MaxxVitCfg(
+#         embed_dim=(192, 384, 768, 1536),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(96, 192),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_act_layer='silu',
+#             init_values=1e-6,
+#         ),
+#     ),
+
+#     # Experimental CoAtNet configs w/ ImageNet-1k train (different norm layers, MLP rel-pos)
+#     coatnet_bn_0_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 3, 7, 2),  # deeper than paper '0' model
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_early=True,
+#             transformer_shortcut_bias=False,
+#             transformer_norm_layer='batchnorm2d',
+#         )
+#     ),
+#     coatnet_rmlp_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(3, 4, 6, 3),
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(
+#             conv_output_bias=True,
+#             conv_attn_ratio=0.25,
+#             rel_pos_type='mlp',
+#             rel_pos_dim=384,
+#         ),
+#     ),
+#     coatnet_rmlp_0_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 3, 7, 2),  # deeper than paper '0' model
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             rel_pos_type='mlp',
+#         ),
+#     ),
+#     coatnet_rmlp_1_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             pool_type='max',
+#             conv_attn_early=True,
+#             transformer_shortcut_bias=False,
+#             rel_pos_type='mlp',
+#             rel_pos_dim=384,  # was supposed to be 512, woops
+#         ),
+#     ),
+#     coatnet_rmlp_1_rw2=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(32, 64),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             rel_pos_type='mlp',
+#             rel_pos_dim=512,  # was supposed to be 512, woops
+#         ),
+#     ),
+#     coatnet_rmlp_2_rw=MaxxVitCfg(
+#         embed_dim=(128, 256, 512, 1024),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(64, 128),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_act_layer='silu',
+#             init_values=1e-6,
+#             rel_pos_type='mlp'
+#         ),
+#     ),
+#     coatnet_rmlp_3_rw=MaxxVitCfg(
+#         embed_dim=(192, 384, 768, 1536),
+#         depths=(2, 6, 14, 2),
+#         stem_width=(96, 192),
+#         **_rw_coat_cfg(
+#             stride_mode='dw',
+#             conv_attn_act_layer='silu',
+#             init_values=1e-6,
+#             rel_pos_type='mlp'
+#         ),
+#     ),
+
+#     coatnet_nano_cc=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(3, 4, 6, 3),
+#         stem_width=(32, 64),
+#         block_type=('C', 'C', ('C', 'T'), ('C', 'T')),
+#         **_rw_coat_cfg(),
+#     ),
+#     coatnext_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(3, 4, 6, 3),
+#         stem_width=(32, 64),
+#         weight_init='normal',
+#         **_next_cfg(
+#             rel_pos_type='bias',
+#             init_values=(1e-5, None)
+#         ),
+#     ),
+
+#     # Trying to be like the CoAtNet paper configs
+#     coatnet_0=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 3, 5, 2),
+#         stem_width=64,
+#         head_hidden_size=768,
+#     ),
+#     coatnet_1=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         stem_width=64,
+#         head_hidden_size=768,
+#     ),
+#     coatnet_2=MaxxVitCfg(
+#         embed_dim=(128, 256, 512, 1024),
+#         depths=(2, 6, 14, 2),
+#         stem_width=128,
+#         head_hidden_size=1024,
+#     ),
+#     coatnet_3=MaxxVitCfg(
+#         embed_dim=(192, 384, 768, 1536),
+#         depths=(2, 6, 14, 2),
+#         stem_width=192,
+#         head_hidden_size=1536,
+#     ),
+#     coatnet_4=MaxxVitCfg(
+#         embed_dim=(192, 384, 768, 1536),
+#         depths=(2, 12, 28, 2),
+#         stem_width=192,
+#         head_hidden_size=1536,
+#     ),
+#     coatnet_5=MaxxVitCfg(
+#         embed_dim=(256, 512, 1280, 2048),
+#         depths=(2, 12, 28, 2),
+#         stem_width=192,
+#         head_hidden_size=2048,
+#     ),
+
+#     # Experimental MaxVit configs
+#     maxvit_pico_rw=MaxxVitCfg(
+#         embed_dim=(32, 64, 128, 256),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(24, 32),
+#         **_rw_max_cfg(),
+#     ),
+#     maxvit_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(1, 2, 3, 1),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(),
+#     ),
+#     maxvit_tiny_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(),
+#     ),
+#     maxvit_tiny_pm=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 2, 5, 2),
+#         block_type=('PM',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(),
+#     ),
+
+#     maxvit_rmlp_pico_rw=MaxxVitCfg(
+#         embed_dim=(32, 64, 128, 256),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(24, 32),
+#         **_rw_max_cfg(rel_pos_type='mlp'),
+#     ),
+#     maxvit_rmlp_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(1, 2, 3, 1),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(rel_pos_type='mlp'),
+#     ),
+#     maxvit_rmlp_tiny_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(rel_pos_type='mlp'),
+#     ),
+#     maxvit_rmlp_small_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_rw_max_cfg(
+#             rel_pos_type='mlp',
+#             init_values=1e-6,
+#         ),
+#     ),
+#     maxvit_rmlp_base_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         head_hidden_size=768,
+#         **_rw_max_cfg(
+#             rel_pos_type='mlp',
+#         ),
+#     ),
+
+#     maxxvit_rmlp_nano_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(1, 2, 3, 1),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         weight_init='normal',
+#         **_next_cfg(),
+#     ),
+#     maxxvit_rmlp_tiny_rw=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(32, 64),
+#         **_next_cfg(),
+#     ),
+#     maxxvit_rmlp_small_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(48, 96),
+#         **_next_cfg(),
+#     ),
+
+#     maxxvitv2_nano_rw=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(1, 2, 3, 1),
+#         block_type=('M',) * 4,
+#         stem_width=(48, 96),
+#         weight_init='normal',
+#         **_next_cfg(
+#             no_block_attn=True,
+#             rel_pos_type='bias',
+#         ),
+#     ),
+#     maxxvitv2_rmlp_base_rw=MaxxVitCfg(
+#         embed_dim=(128, 256, 512, 1024),
+#         depths=(2, 6, 12, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(64, 128),
+#         **_next_cfg(
+#             no_block_attn=True,
+#         ),
+#     ),
+#     maxxvitv2_rmlp_large_rw=MaxxVitCfg(
+#         embed_dim=(160, 320, 640, 1280),
+#         depths=(2, 6, 16, 2),
+#         block_type=('M',) * 4,
+#         stem_width=(80, 160),
+#         head_hidden_size=1280,
+#         **_next_cfg(
+#             no_block_attn=True,
+#         ),
+#     ),
+
+#     # Trying to be like the MaxViT paper configs
+#     maxvit_tiny_tf=MaxxVitCfg(
+#         embed_dim=(64, 128, 256, 512),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=64,
+#         stem_bias=True,
+#         head_hidden_size=512,
+#         **_tf_cfg(),
+#     ),
+#     maxvit_small_tf=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 2, 5, 2),
+#         block_type=('M',) * 4,
+#         stem_width=64,
+#         stem_bias=True,
+#         head_hidden_size=768,
+#         **_tf_cfg(),
+#     ),
+#     maxvit_base_tf=MaxxVitCfg(
+#         embed_dim=(96, 192, 384, 768),
+#         depths=(2, 6, 14, 2),
+#         block_type=('M',) * 4,
+#         stem_width=64,
+#         stem_bias=True,
+#         head_hidden_size=768,
+#         **_tf_cfg(),
+#     ),
+#     maxvit_large_tf=MaxxVitCfg(
+#         embed_dim=(128, 256, 512, 1024),
+#         depths=(2, 6, 14, 2),
+#         block_type=('M',) * 4,
+#         stem_width=128,
+#         stem_bias=True,
+#         head_hidden_size=1024,
+#         **_tf_cfg(),
+#     ),
+#     maxvit_xlarge_tf=MaxxVitCfg(
+#         embed_dim=(192, 384, 768, 1536),
+#         depths=(2, 6, 14, 2),
+#         block_type=('M',) * 4,
+#         stem_width=192,
+#         stem_bias=True,
+#         head_hidden_size=1536,
+#         **_tf_cfg(),
+#     ),
+# )
+#Above part not needed so Commented
+# Define a function to filter and adjust model state dictionaries during checkpoint loading.
+def checkpoint_filter_fn(state_dict, model: nn.Module):
+    # Obtain the current model's state dictionary.
+    model_state_dict = model.state_dict()
+    # Initialize an empty dictionary to store the adjusted state.
+    out_dict = {}
+    # Iterate over the provided state dictionary.
+    for k, v in state_dict.items():
+        # Check if the key ends with a specific string indicating a relative position bias table.
+        if k.endswith("relative_position_bias_table"):
+            # Extract the corresponding submodule from the model.
+            m = model.get_submodule(k[:-29])
+            # Check if the shape of the provided table does not match the model's or if the window sizes are unequal.
+            if (
+                v.shape != m.relative_position_bias_table.shape
+                or m.window_size[0] != m.window_size[1]
+            ):
+                # Resize the relative position bias table to match the model's expected shape and window size.
+                v = resize_rel_pos_bias_table(
+                    v,
+                    new_window_size=m.window_size,
+                    new_bias_shape=m.relative_position_bias_table.shape,
+                )
+        
+        # Check if the key exists in the model's state dict, the dimensions differ, but the number of elements is the same.
+        if (
+            k in model_state_dict
+            and v.ndim != model_state_dict[k].ndim
+            and v.numel() == model_state_dict[k].numel()
+        ):
+            # Assert that the dimensions are either for a 2D (linear layer) or a 4D (conv2d layer).
+            assert v.ndim in (2, 4)
+            # Reshape the tensor to match the model's expected shape.
+            v = v.reshape(model_state_dict[k].shape)
+        # Update the output dictionary with the potentially adjusted tensor.
+        out_dict[k] = v
+    # Return the adjusted state dictionary.
+    return out_dict
+
+# Define a function to create a MaxxVit model variant based on provided configurations.
+def _create_maxxvit(variant, cfg_variant=None, pretrained=False, **kwargs):
+    # Determine the configuration variant.
+    if cfg_variant is None:
+        # Use the provided variant directly if it exists in the configurations, else modify it.
+        if variant in model_cfgs:
+            cfg_variant = variant
+        else:
+            cfg_variant = "_".join(variant.split("_")[:-1])
+    # Build and return the model using the selected configuration.
+    return build_model_with_cfg(
+        MaxxVit,
+        variant,
+        pretrained,
+        model_cfg=model_cfgs[cfg_variant],
+        feature_cfg=dict(flatten_sequential=True),
+        pretrained_filter_fn=checkpoint_filter_fn,
+        **kwargs,
+    )
+
+# Define a function to create a default model configuration.
+def _cfg(url="", **kwargs):
+    # Return a dictionary containing default configuration parameters for a model.
+    return {
+        "url": url,
+        "num_classes": 1000,
+        "input_size": (3, 64, 64),
+        "pool_size": (7, 7),
+        "crop_pct": 0.95,
+        "interpolation": "bicubic",
+        "mean": (0.5, 0.5, 0.5),
+        "std": (0.5, 0.5, 0.5),
+        "first_conv": "stem.conv1",
+        "classifier": "head.fc",
+        "fixed_input_size": True,
+        **kwargs,
+    }
+
+# Generate default configurations for various untrained CoatNet models.
+default_cfgs = generate_default_cfgs(
+    { # timm specific CoAtNet configs, ImageNet-1k pretrain, fixed rel-pos
+    'coatnet_pico_rw_224.untrained': _cfg(url=''),
+    'coatnet_nano_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_nano_rw_224_sw-f53093b4.pth',
+        crop_pct=0.9),
+    'coatnet_0_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_0_rw_224_sw-a6439706.pth'),
+    'coatnet_1_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_1_rw_224_sw-5cae1ea8.pth'
+    ),
+
+    # timm specific CoAtNet configs, ImageNet-12k pretrain w/ 1k fine-tune, fixed rel-pos
+    'coatnet_2_rw_224.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/'),
+    #'coatnet_3_rw_224.untrained': _cfg(url=''),
+
+    # Experimental CoAtNet configs w/ ImageNet-12k pretrain -> 1k fine-tune (different norm layers, MLP rel-pos)
+    'coatnet_rmlp_1_rw2_224.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/'),
+    'coatnet_rmlp_2_rw_224.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/'),
+    'coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+
+    # Experimental CoAtNet configs w/ ImageNet-1k train (different norm layers, MLP rel-pos)
+    'coatnet_bn_0_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_bn_0_rw_224_sw-c228e218.pth',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD,
+        crop_pct=0.95),
+    'coatnet_rmlp_nano_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_rmlp_nano_rw_224_sw-bd1d51b3.pth',
+        crop_pct=0.9),
+    'coatnet_rmlp_0_rw_224.untrained': _cfg(url=''),
+    'coatnet_rmlp_1_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_rmlp_1_rw_224_sw-9051e6c3.pth'),
+    'coatnet_rmlp_2_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnet_rmlp_2_rw_224_sw-5ccfac55.pth'),
+    'coatnet_rmlp_3_rw_224.untrained': _cfg(url=''),
+    'coatnet_nano_cc_224.untrained': _cfg(url=''),
+    'coatnext_nano_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/coatnext_nano_rw_224_ad-22cb71c2.pth',
+        crop_pct=0.9),
+
+    # ImagenNet-12k pretrain CoAtNet
+    'coatnet_2_rw_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821),
+    'coatnet_3_rw_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821),
+    'coatnet_rmlp_1_rw2_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821),
+    'coatnet_rmlp_2_rw_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821),
+
+    # Trying to be like the CoAtNet paper configs (will adapt if 'tf' weights are ever released)
+    'coatnet_0_224.untrained': _cfg(url=''),
+    'coatnet_1_224.untrained': _cfg(url=''),
+    'coatnet_2_224.untrained': _cfg(url=''),
+    'coatnet_3_224.untrained': _cfg(url=''),
+    'coatnet_4_224.untrained': _cfg(url=''),
+    'coatnet_5_224.untrained': _cfg(url=''),
+
+    # timm specific MaxVit configs, ImageNet-1k pretrain or untrained
+    'maxvit_pico_rw_256.untrained': _cfg(url='', input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_nano_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_nano_rw_256_sw-fb127241.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_tiny_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_tiny_rw_224_sw-7d0dffeb.pth'),
+    'maxvit_tiny_rw_256.untrained': _cfg(
+        url='',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_tiny_pm_256.untrained': _cfg(url='', input_size=(3, 256, 256), pool_size=(8, 8)),
+
+    # timm specific MaxVit w/ MLP rel-pos, ImageNet-1k pretrain
+    'maxvit_rmlp_pico_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_rmlp_pico_rw_256_sw-8d82f2c6.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_rmlp_nano_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_rmlp_nano_rw_256_sw-c17bb0d6.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_rmlp_tiny_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_rmlp_tiny_rw_256_sw-bbef0ff5.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxvit_rmlp_small_rw_224.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxvit_rmlp_small_rw_224_sw-6ef0ae4f.pth',
+        crop_pct=0.9,
+    ),
+    'maxvit_rmlp_small_rw_256.untrained': _cfg(
+        url='',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+
+    # timm specific MaxVit w/ ImageNet-12k pretrain and 1k fine-tune
+    'maxvit_rmlp_base_rw_224.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+    ),
+    'maxvit_rmlp_base_rw_384.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+
+    # timm specific MaxVit w/ ImageNet-12k pretrain
+    'maxvit_rmlp_base_rw_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821,
+    ),
+
+    # timm MaxxViT configs (ConvNeXt conv blocks mixed with MaxVit transformer blocks)
+    'maxxvit_rmlp_nano_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxxvit_rmlp_nano_rw_256_sw-0325d459.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxxvit_rmlp_tiny_rw_256.untrained': _cfg(url='', input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxxvit_rmlp_small_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-maxx/maxxvit_rmlp_small_rw_256_sw-37e217ff.pth',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+
+    # timm MaxxViT-V2 configs (ConvNeXt conv blocks mixed with MaxVit transformer blocks, more width, no block attn)
+    'maxxvitv2_nano_rw_256.sw_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256), pool_size=(8, 8)),
+    'maxxvitv2_rmlp_base_rw_224.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/'),
+    'maxxvitv2_rmlp_base_rw_384.sw_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxxvitv2_rmlp_large_rw_224.untrained': _cfg(url=''),
+
+    'maxxvitv2_rmlp_base_rw_224.sw_in12k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821),
+
+    # MaxViT models ported from official Tensorflow impl
+    'maxvit_tiny_tf_224.in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'maxvit_tiny_tf_384.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_tiny_tf_512.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_small_tf_224.in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'maxvit_small_tf_384.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_small_tf_512.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_base_tf_224.in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'maxvit_base_tf_384.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_base_tf_512.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_large_tf_224.in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'maxvit_large_tf_384.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_large_tf_512.in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+
+    'maxvit_base_tf_224.in21k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=21843),
+    'maxvit_base_tf_384.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_base_tf_512.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_large_tf_224.in21k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=21843),
+    'maxvit_large_tf_384.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_large_tf_512.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_xlarge_tf_224.in21k': _cfg(
+        hf_hub_id='timm/',
+        num_classes=21843),
+    'maxvit_xlarge_tf_384.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
+    'maxvit_xlarge_tf_512.in21k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
+    }
+)
+
+@register_model
+def astroformer_5(pretrained=False, **kwargs) -> MaxxVit:
+    return _create_maxxvit("astroformer_5", pretrained=pretrained, **kwargs)
