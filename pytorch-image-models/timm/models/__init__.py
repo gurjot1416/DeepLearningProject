@@ -1,4 +1,4 @@
-from .astroformer import *
+from .MyAstroformer import *
 from .beit import *
 from .byoanet import *
 from .byobnet import *
