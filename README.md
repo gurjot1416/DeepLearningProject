@@ -17,7 +17,9 @@ Our implementation closely follows the original Astroformer model, with particul
 MyAstroformer.py is the backbone of our model implementation.
 Training the model using the timm framework, with modifications as necessary to adapt to our computing resources and available datasets.
 Modifications and additions to the pytorch-image-models library to incorporate the Astroformer model, specifically:
+
 Adding timm/models/MyAstroformer.py
+
 Modifying timm/models/__init__.py
 
 **Training**
