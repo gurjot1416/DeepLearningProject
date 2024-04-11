@@ -5,7 +5,9 @@ This repository is part of a reproducibility challenge aimed at replicating the 
 *Original Paper*
 
 Title: Astroformer: More Data Might Not Be All You Need for Classification
+
 Authors: Rishit-dagli
+
 Link to the Paper: [[arXiv link]](https://arxiv.org/abs/2304.05350)
 
 **Implementation Overview**
