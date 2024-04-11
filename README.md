@@ -14,10 +14,10 @@ Link to the Paper: [[arXiv link]](https://arxiv.org/abs/2304.05350)
 
 Our implementation closely follows the original Astroformer model, with particular focus on the architecture and training procedure as outlined in the original repository. Key aspects of our replication include:
 
-Utilizing the astroformer.py file as the backbone of our model implementation.
+MyAstroformer.py is the backbone of our model implementation.
 Training the model using the timm framework, with modifications as necessary to adapt to our computing resources and available datasets.
 Modifications and additions to the pytorch-image-models library to incorporate the Astroformer model, specifically:
-Adding timm/models/astroformer.py
+Adding timm/models/MyAstroformer.py
 Modifying timm/models/__init__.py
 
 **Training**
