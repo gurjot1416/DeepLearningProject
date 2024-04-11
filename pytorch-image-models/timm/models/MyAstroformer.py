@@ -1,7 +1,6 @@
 #THIS CODE IS HIGHLY ADAPTED FROM TIMM
 # Importing Necessary Libraries
 import numpy as np
-import pandas as pd
 import math
 import sys
 from collections import OrderedDict
