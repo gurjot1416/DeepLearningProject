@@ -1,4 +1,4 @@
-**Replicated Astroformer**
+***Replicated Astroformer***
 
 This repository is part of a reproducibility challenge aimed at replicating the results of the original Astroformer paper, presented at the ICLR Workshop 2023. Our goal was to assess the reproducibility of Astroformer, a model designed for detection tasks in low-data regimes, and its performance on several datasets including CIFAR-100, Tiny ImageNet, Galaxy10 DECals, and CIFAR-10.
 
